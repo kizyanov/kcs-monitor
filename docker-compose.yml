@@ -1,0 +1,47 @@
+# Production-развёртывание kcs-monitor: только приложение.
+#
+# База данных и миграции живут отдельно (у вас это cryptodb + sqlxmigrator),
+# поэтому здесь лишь сервис монитора. Все настройки (DATABASE_URL, KCS_*)
+# приложение берёт из файла .env; если файла нет или переменной в нём нет —
+# работают встроенные в приложение значения по умолчанию (БД тогда отключена).
+#
+# Приложение работает циклом: REST-свип закрытых свечей → пауза
+# KCS_INTERVAL_SECONDS (по умолчанию 600 с) → снова свип.
+#
+# Запуск:      docker compose up -d        (restart: unless-stopped поднимает
+#                                          после падений и перезагрузки хоста)
+# Логи:        docker compose logs -f
+# Остановка:   docker compose down         (SIGTERM: процесс сбросит буфер БД)
+#
+# Вариант «по расписанию» вместо цикла: поставь KCS_INTERVAL_SECONDS=0 и
+# вызывай разово из cron:
+#      5 * * * * cd /opt/kcs-monitor && docker compose run --rm app
+#
+# Создайте .env из .env.example и укажите как минимум DATABASE_URL.
+# .env не коммитится; секреты храните вне репозитория.
+
+name: kcs-monitor
+
+services:
+  app:
+    build: .
+    image: kcs-monitor:latest
+    restart: unless-stopped
+    # network_mode: host — приложение только ходит наружу (WS/REST/БД) и не
+    # слушает порты, поэтому host-сеть безопасна и проще в окружениях, где
+    # исходящий трафик разрешён только с хоста (в обычном Docker можно
+    # переключить на стандартный bridge, убрав эту строку).
+    network_mode: host
+    # Единственный источник переменных окружения — файл .env рядом с compose.
+    env_file:
+      - path: .env
+        required: false
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    # Необязательные ограничения ресурсов:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "1.0"
+    #       memory: 128M

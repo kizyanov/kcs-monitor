@@ -1,0 +1,40 @@
+[package]
+name = "kcs-monitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+dotenvy = "0.15.7"
+rustls = { version = "0.23.44", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal"] }
+tokio-rustls = { version = "0.26.5", default-features = false }
+webpki-roots = "1.0.9"
+
+# Продакшен-профиль: максимум оптимизации ценой времени сборки.
+# lto="fat" даёт максимум инлайнинга, но заметно дольше/тяжелее линковка
+# (для CI-сборок обычно хватает lto="thin" — ~90% выигрыша без простоя).
+# panic="abort": паника любой задачи = мгновенный abort процесса (сообщение в
+# stderr, контейнер перезапустится по restart-политике).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+incremental = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.test]
+inherits = "dev"
+opt-level = 1
