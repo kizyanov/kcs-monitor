@@ -16,6 +16,14 @@ pub struct Config {
     pub bars_first: usize,
     /// Максимум одновременных REST-запросов.
     pub concurrency: usize,
+    /// Допустимый вес запросов к публичному API в секунду.
+    ///
+    /// KuCoin ограничивает не число запросов, а их вес: публичный пул считается
+    /// по IP и для VIP0 равен 4000 weight / 30 с (≈133 вес/с), вес
+    /// `/api/v1/market/candles` — 3, `/api/v1/symbols` — 4. По умолчанию 60 —
+    /// примерно вдвое ниже лимита: остаётся запас на всплески и на других
+    /// потребителей с того же IP.
+    pub rate_limit_weight_per_sec: f64,
     /// Пауза между свипами, секунды. 0 = один проход и выход (для cron).
     pub interval_secs: u64,
     /// URL PostgreSQL; None = свечи выводятся в stdout, без записи.
@@ -63,6 +71,10 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8)
                 .max(1),
+            rate_limit_weight_per_sec: env("KCS_RATE_LIMIT_WEIGHT_PER_SEC")
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(60.0),
             interval_secs: env("KCS_INTERVAL_SECONDS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600),

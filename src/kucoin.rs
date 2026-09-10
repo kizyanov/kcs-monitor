@@ -3,8 +3,15 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::http::HttpClient;
+
 pub const DEFAULT_API_BASE: &str = "https://api.kucoin.com";
 const OK_CODE: &str = "200000";
+
+/// Вес эндпоинтов в публичном пуле KuCoin (из документации API): пул считается
+/// по IP, для VIP0 это 4000 weight / 30 с, поэтому вес учитывает лимитер.
+pub const CANDLES_WEIGHT: f64 = 3.0;
+pub const SYMBOLS_WEIGHT: f64 = 4.0;
 
 /// Допустимые типы свечей KuCoin (spot) — используются в параметре `type`.
 pub const VALID_KLINE_INTERVALS: &[&str] = &[
@@ -78,10 +85,10 @@ fn ensure_ok(v: &serde_json::Value) -> Result<()> {
 /// Возвращает отсортированный список торгуемых пар (или отфильтрованный по
 /// `symbols_override`, если он задан).
 pub async fn fetch_symbols(
-    api_base: &str,
+    client: &HttpClient,
     symbols_override: &Option<String>,
 ) -> Result<Vec<String>> {
-    let v = crate::http::get_json(api_base, "/api/v1/symbols").await?;
+    let v = client.get_json("/api/v1/symbols", SYMBOLS_WEIGHT).await?;
     ensure_ok(&v)?;
     let symbols: Vec<Symbol> = serde_json::from_value(
         v.get("data")
@@ -109,7 +116,7 @@ pub async fn fetch_symbols(
 /// Запрашивает страницу свечей (новые сверху, до ~100 строк) за окно
 /// [start_at, end_at] (unix-сек; None = без соответствующей границы).
 pub async fn fetch_kline_page(
-    api_base: &str,
+    client: &HttpClient,
     symbol: &str,
     interval: &str,
     start_at: Option<i64>,
@@ -133,7 +140,7 @@ pub async fn fetch_kline_page(
             .collect::<Vec<_>>()
             .join("&")
     );
-    let v = crate::http::get_json(api_base, &path).await?;
+    let v = client.get_json(&path, CANDLES_WEIGHT).await?;
     ensure_ok(&v)?;
 
     let rows: Vec<Vec<String>> = serde_json::from_value(

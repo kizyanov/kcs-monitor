@@ -22,9 +22,11 @@ mod http;
 mod kucoin;
 mod sweep;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use config::Config;
+use http::{HttpClient, RateLimiter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,6 +63,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.api_base
     );
 
+    // Один клиент и один лимитер на процесс: темп запросов считается по весу
+    // эндпоинтов (публичный пул KuCoin ограничен по IP), а 429 ставит на паузу
+    // сразу все задачи, а не только ту, что его получила.
+    let limiter = Arc::new(RateLimiter::new(cfg.rate_limit_weight_per_sec));
+    let client = Arc::new(HttpClient::new(&cfg.api_base, limiter)?);
+    eprintln!(
+        "kcs-monitor: лимит запросов {} weight/s (публичный пул KuCoin: 4000 weight/30s на IP)",
+        cfg.rate_limit_weight_per_sec
+    );
+
     // Запись в БД (если задан DATABASE_URL), иначе вывод в stdout.
     // Писатель живёт все циклы и закрывается при выходе.
     let db_tx: Option<db::CandleSender> = match &cfg.db_url {
@@ -82,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         // Список пар обновляем каждый цикл.
         let symbols = tokio::select! {
             _ = wait_for_shutdown() => break,
-            res = kucoin::fetch_symbols(&cfg.api_base, &cfg.symbols_override) => res?,
+            res = kucoin::fetch_symbols(&client, &cfg.symbols_override) => res?,
         };
         if symbols.is_empty() {
             eprintln!("kcs-monitor: список символов пуст — пропускаю цикл");
@@ -99,14 +111,15 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("kcs-monitor: остановка по сигналу");
                     break;
                 }
-                s = sweep::run(&cfg, &symbols, bars, db_tx.as_ref()) => s,
+                s = sweep::run(&cfg, &client, &symbols, bars, db_tx.as_ref()) => s,
             };
             eprintln!(
-                "kcs-monitor: свип #{sweep_no} ({bars} бар/пару) за {:.1}s: пар ок {}, ошибок {}, свечей {}",
+                "kcs-monitor: свип #{sweep_no} ({bars} бар/пару) за {:.1}s: пар ок {}, ошибок {}, свечей {} (из них 429: {})",
                 started.elapsed().as_secs_f64(),
                 summary.pairs_ok,
                 summary.pairs_err,
-                summary.candles
+                summary.candles,
+                summary.rate_limited
             );
             // В разовом режиме ошибки важны для cron — возвращаем код 1.
             if cfg.interval_secs == 0 && summary.pairs_err > 0 {

@@ -10,12 +10,17 @@ use tokio::sync::Semaphore;
 use crate::candle::{candle_to_json_line, from_rest_candle};
 use crate::config::Config;
 use crate::db::CandleSender;
+use crate::http::{HttpClient, RateLimited, jitter_ms};
 use crate::kucoin::{RestCandle, fetch_kline_page, forming_bucket_start};
 
 /// Максимум баров, которые REST отдаёт за один запрос (страница).
 const PAGE_MAX: usize = 100;
 /// Ограничение «глубины» свипа на пару×интервал (страховка).
 const BARS_CAP: usize = 1500;
+/// Число попыток на страницу свечей.
+const ATTEMPTS: u32 = 5;
+/// Потолок выдержки между попытками.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Итоги свипа.
 #[derive(Debug, Default)]
@@ -23,6 +28,19 @@ pub struct Summary {
     pub pairs_ok: usize,
     pub pairs_err: usize,
     pub candles: u64,
+    /// Сколько пар×интервалов так и не удалось забрать из-за 429.
+    pub rate_limited: usize,
+}
+
+/// Выдержка перед повтором: экспонента от номера попытки плюс джиттер.
+///
+/// Для 429 база меньше — саму паузу уже держит общий лимитер (по заголовкам
+/// `gw-ratelimit-*`), здесь нужно лишь развести задачи во времени.
+fn backoff_delay(attempt: u32, rate_limited: bool, jitter: u64) -> Duration {
+    let base_ms = if rate_limited { 250 } else { 300 };
+    let exp = base_ms << (attempt.saturating_sub(1)).min(4);
+    let jitter = jitter % (base_ms + 1);
+    Duration::from_millis(exp.min(MAX_BACKOFF.as_millis() as u64) + jitter)
 }
 
 /// Печатает свечу в stdout.
@@ -38,7 +56,7 @@ fn emit_line(c: &crate::candle::CandleUpdate) {
 /// Первый запрос ограничиваем окном `startAt`, чтобы биржа не отдавала
 /// лишние строки: при 3 барах это вместо 100 строк пары — 3.
 async fn fetch_closed(
-    api_base: &str,
+    client: &HttpClient,
     symbol: &str,
     interval: &str,
     bars: usize,
@@ -60,7 +78,7 @@ async fn fetch_closed(
     let mut pages = 0usize;
 
     while closed.len() < cap && pages < BARS_CAP / PAGE_MAX + 2 {
-        let page = fetch_with_retries(api_base, symbol, interval, start_at, end_at).await?;
+        let page = fetch_with_retries(client, symbol, interval, start_at, end_at).await?;
         pages += 1;
         if page.is_empty() {
             break;
@@ -88,25 +106,29 @@ async fn fetch_closed(
     Ok(closed)
 }
 
-/// Запрос истории с парой повторных попыток: сеть/TLS иногда отваливается
-/// (`tls handshake eof`), и одна неудачная пара не должна портить свип.
+/// Запрос истории с повторными попытками: сеть/TLS иногда отваливается
+/// (`tls handshake eof`), а биржа изредка отвечает 429 — одна неудачная пара
+/// не должна портить свип.
+///
+/// При 429 общий лимитер уже поставил на паузу все задачи процесса, поэтому
+/// здесь добавляем только короткую выдержку с джиттером, чтобы задачи не
+/// проснулись синхронно и не повторили залп.
 async fn fetch_with_retries(
-    api_base: &str,
+    client: &HttpClient,
     symbol: &str,
     interval: &str,
     start_at: Option<i64>,
     end_at: Option<i64>,
 ) -> Result<Vec<RestCandle>> {
-    const ATTEMPTS: u32 = 3;
     let mut last_err = None;
     for attempt in 1..=ATTEMPTS {
-        match fetch_kline_page(api_base, symbol, interval, start_at, end_at).await {
+        match fetch_kline_page(client, symbol, interval, start_at, end_at).await {
             Ok(rows) => return Ok(rows),
             Err(e) => {
+                let rate_limited = e.downcast_ref::<RateLimited>().is_some();
                 last_err = Some(e);
                 if attempt < ATTEMPTS {
-                    let pause = Duration::from_millis(300 * u64::from(attempt));
-                    tokio::time::sleep(pause).await;
+                    tokio::time::sleep(backoff_delay(attempt, rate_limited, jitter_ms())).await;
                 }
             }
         }
@@ -117,6 +139,7 @@ async fn fetch_with_retries(
 /// Один свип по всем парам × интервалам с ограниченной конкурентностью.
 pub async fn run(
     cfg: &Config,
+    client: &Arc<HttpClient>,
     symbols: &[String],
     bars: usize,
     db_tx: Option<&CandleSender>,
@@ -130,7 +153,7 @@ pub async fn run(
 
     for symbol in symbols {
         for interval in &cfg.kline_intervals {
-            let api_base = cfg.api_base.clone();
+            let client = client.clone();
             let exchange = cfg.exchange.clone();
             let symbol = symbol.clone();
             let interval = interval.clone();
@@ -138,7 +161,7 @@ pub async fn run(
             let db_tx = db_tx.cloned();
             tasks.spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore");
-                let closed = fetch_closed(&api_base, &symbol, &interval, bars).await?;
+                let closed = fetch_closed(&client, &symbol, &interval, bars).await?;
                 let mut n = 0u64;
                 for c in closed {
                     let update = from_rest_candle(&exchange, &symbol, &interval, c);
@@ -163,6 +186,9 @@ pub async fn run(
             }
             Ok(Err(e)) => {
                 summary.pairs_err += 1;
+                if e.downcast_ref::<RateLimited>().is_some() {
+                    summary.rate_limited += 1;
+                }
                 eprintln!("[sweep] ошибка: {e:#}");
             }
             Err(e) => {
@@ -172,4 +198,35 @@ pub async fn run(
         }
     }
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        let first = backoff_delay(1, false, 0);
+        let second = backoff_delay(2, false, 0);
+        let third = backoff_delay(3, false, 0);
+        assert_eq!(first, Duration::from_millis(300));
+        assert_eq!(second, Duration::from_millis(600));
+        assert_eq!(third, Duration::from_millis(1200));
+        // Экспонента не растёт бесконечно и не превышает потолок с джиттером.
+        for attempt in 1..=10 {
+            for jitter in [0, 250, 999] {
+                let d = backoff_delay(attempt, false, jitter);
+                assert!(d <= MAX_BACKOFF + Duration::from_millis(300), "{d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limited_backoff_keeps_jitter_within_base() {
+        for jitter in [0, 100, 999] {
+            let d = backoff_delay(1, true, jitter);
+            assert!(d >= Duration::from_millis(250), "{d:?}");
+            assert!(d <= Duration::from_millis(500), "{d:?}");
+        }
+    }
 }
