@@ -26,6 +26,7 @@ services:
   app:
     build: .
     image: ghcr.io/bizkey/kcs-monitor/kcs-monitor:latest
+    pull_policy: always
     restart: unless-stopped
     # network_mode: host — приложение только ходит наружу (WS/REST/БД) и не
     # слушает порты, поэтому host-сеть безопасна и проще в окружениях, где
